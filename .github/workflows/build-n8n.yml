@@ -157,7 +157,6 @@ jobs:
           set -euo pipefail
           pnpm install --frozen-lockfile
           pnpm build:n8n
-          sed -i 's|/usr/local/bin/n8n|/usr/bin/n8n|g' docker/images/n8n/Dockerfile
 
       - name: Set up QEMU
         if: steps.existing.outputs.skip != 'true'
