@@ -1,217 +1,212 @@
-name: Fix n8n and build docker
+name: Build latest n8n image
 
 on:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: "23 3 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-n8n.yml
+      - locales/**
+      - scripts/apply_i18n_compat.mjs
   workflow_dispatch:
     inputs:
-      ref:
-        description: '拉取标签，格式: owner/repo@tag，例如: n8n-io/n8n@2.1.1'
+      version:
+        description: "Optional stable n8n version, for example 2.34.5"
         required: false
-        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-n8n-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/n8n
 
 jobs:
-  apply-patch:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
+  build:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
     steps:
-      - name: 检出代码
+      - name: Check out customizations
         uses: actions/checkout@v4
-        
-      - name: 释放磁盘空间
-        uses: jlumbroso/free-disk-space@main
         with:
-          # 可选参数，保留某些工具，默认会删除大量预装软件
-          tool-cache: true    # 删除 GitHub 的 tool cache（约 10GB）
-          android: true       # 删除 Android SDK（约 12GB）
-          dotnet: true        # 删除 .NET SDK（约 10GB）
-          haskell: true       # 删除 Haskell 平台（约 2GB）
-          large-packages: true # 删除一些大包（如 mysql, azure-cli 等）
-          docker-images: true  # 删除所有预装的 Docker 镜像（约 2GB）
-          swap-storage: true   # 清理 swap 文件
+          path: customization
 
-      - name: 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 获取最新 n8n 版本
-        id: latest-version
-        run: |
-          pip install requests packaging
-          python scripts/get_latest_n8n_release.py
+      - name: Resolve stable n8n release
+        id: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
-
-      - name: 输出最新版本
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          echo "最新 n8n 版本: ${{ steps.latest-version.outputs.LATEST_TAG }}"
+          set -euo pipefail
 
-      - name: 解析仓库和标签
-        id: parse-ref
-        if: inputs.ref != ''
-        run: |
-          REFS="${{ inputs.ref }}"
-          
-          if [[ "$REFS" == *"@"* ]]; then
-            REPO_PART=$(echo "$REFS" | cut -d'@' -f1)
-            TAG="${{ inputs.ref }}"  # 完整标签，包括前缀
-            
-            if [[ "$REPO_PART" == *"/"* ]]; then
-              REPO="$REPO_PART"
-            else
-              REPO="n8n-io/$REPO_PART"
-            fi
-            
-            echo "repository=$REPO" >> $GITHUB_OUTPUT
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-            echo "解析结果: 仓库=$REPO, 标签=$TAG"
-          else
-            echo "格式错误，请使用 仓库名@标签 格式"
+          version="${REQUESTED_VERSION#n8n@}"
+          if [[ -z "$version" ]]; then
+            release_tag="$(gh api repos/n8n-io/n8n/releases/latest --jq .tag_name)"
+            version="${release_tag#n8n@}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported n8n version: $version" >&2
             exit 1
           fi
 
-      - name: 拉取目标仓库
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.ref != '' && steps.parse-ref.outputs.repository || 'n8n-io/n8n' }}
-          ref: ${{ inputs.ref != '' && steps.parse-ref.outputs.tag || steps.latest-version.outputs.LATEST_TAG }}
-          fetch-depth: 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_ref=n8n@$version" >> "$GITHUB_OUTPUT"
+          echo "Building n8n $version"
 
-      - name: 拉取locales和patches
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          path: source-repo
-          sparse-checkout: |
-            locales
-            patches
-          sparse-checkout-cone-mode: false
-
-      - name: 复制locales文件
+      - name: Normalize image name
+        id: image
         run: |
-          mkdir -p packages/frontend/@n8n/i18n/src/locales
-          cp -r source-repo/locales/* packages/frontend/@n8n/i18n/src/locales/
+          echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
 
-      - name: 应用patch
-        run: |
-          for patch in source-repo/patches/*.patch; do
-            if [ -f "$patch" ]; then
-              echo "Applying: $patch"
-              git apply "$patch"
-            fi
-          done
-
-      - name: 读取package.json
-        id: package
-        run: |
-          NODE_VERSION=$(grep -o '"node": "[^"]*"' package.json | cut -d'"' -f4 | sed 's/>=//')
-          PNPM_VERSION=$(grep -o '"pnpm": "[^"]*"' package.json | cut -d'"' -f4 | sed 's/>=//')
-          IMAGE_TAG=$(grep -o '"version": "[^"]*"' package.json | cut -d'"' -f4)
-          echo "node_version=$NODE_VERSION" >> $GITHUB_OUTPUT
-          echo "pnpm_version=$PNPM_VERSION" >> $GITHUB_OUTPUT
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Node version: $NODE_VERSION"
-          echo "Pnpm version: $PNPM_VERSION"
-          echo "Image tag: $IMAGE_TAG"
-
-      - name: 安装Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ steps.package.outputs.node_version }}
-
-      - name: 安装pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: 设置Docker BuildX
-        uses: docker/setup-buildx-action@v3
-
-      - name: 获取小写用户名
-        id: lowercase
-        run: |
-          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "owner=$OWNER_LOWER" >> $GITHUB_OUTPUT
-
-      - name: 登录GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
-      
-      - name: 检查n8n镜像是否已存在
-        id: check-n8n-exists
+          password: ${{ github.token }}
+
+      - name: Check whether scheduled version already exists
+        id: existing
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          if docker manifest inspect ghcr.io/${{ steps.lowercase.outputs.owner }}/n8n:${{ steps.package.outputs.image_tag }} > /dev/null 2>&1; then
-            echo "n8n镜像已存在，跳过构建"
-            echo "skip_build=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "schedule" ]] && \
+             docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:$VERSION already exists; scheduled build is not needed."
           else
-            echo "n8n镜像不存在，需要构建"
-            echo "skip_build=false" >> $GITHUB_OUTPUT
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 检查runners镜像是否已存在
-        id: check-runners-exists
+      - name: Free runner disk space
+        if: steps.existing.outputs.skip != 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check out n8n release
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: n8n-io/n8n
+          ref: ${{ steps.release.outputs.source_ref }}
+          fetch-depth: 1
+          path: n8n-source
+
+      - name: Apply localization compatibility layer
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: n8n-source
         run: |
-          if docker manifest inspect ghcr.io/${{ steps.lowercase.outputs.owner }}/runners:${{ steps.package.outputs.image_tag }} > /dev/null 2>&1; then
-            echo "runners镜像已存在，跳过构建"
-            echo "skip_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "runners镜像不存在，需要构建"
-            echo "skip_build=false" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: 安装依赖
-        if: steps.check-n8n-exists.outputs.skip_build != 'true' || steps.check-runners-exists.outputs.skip_build != 'true'
+          set -euo pipefail
+          install -D -m 0644 ../customization/locales/zh.json \
+            packages/frontend/@n8n/i18n/src/locales/zh.json
+          node ../customization/scripts/apply_i18n_compat.mjs
+          git diff --check
+
+      - name: Resolve Node.js and pnpm versions
+        if: steps.existing.outputs.skip != 'true'
+        id: toolchain
+        working-directory: n8n-source
         run: |
-          rm -rf node_modules packages/*/node_modules
+          set -euo pipefail
+          node_version="$(jq -r '.engines.node' package.json | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1)"
+          pnpm_version="$(jq -r '.packageManager' package.json | cut -d@ -f2)"
+          test -n "$node_version"
+          test -n "$pnpm_version"
+          echo "node_version=$node_version" >> "$GITHUB_OUTPUT"
+          echo "pnpm_version=$pnpm_version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchain.outputs.node_version }}
+
+      - name: Set up pnpm
+        if: steps.existing.outputs.skip != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ steps.toolchain.outputs.pnpm_version }}
+
+      - name: Install and compile n8n
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: n8n-source
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+          TSC_SKIP_LIB_CHECK: "true"
+        run: |
+          set -euo pipefail
           pnpm install --frozen-lockfile
-
-      - name: 验证依赖
-        if: steps.check-n8n-exists.outputs.skip_build != 'true' || steps.check-runners-exists.outputs.skip_build != 'true'
-        run: |
-          ls -la node_modules/zx/ 2>/dev/null && echo "zx 已安装" || echo "zx 未安装"
-
-      - name: 预编译
-        if: steps.check-n8n-exists.outputs.skip_build != 'true' || steps.check-runners-exists.outputs.skip_build != 'true'
-        run: |
-          NODE_OPTIONS="--max-old-space-size=4096" TSC_SKIP_LIB_CHECK=true node scripts/build-n8n.mjs
-
-      - name: 修复Dockerfile中/usr/local/bin路径
-        if: steps.check-n8n-exists.outputs.skip_build != 'true'
-        run: |
+          pnpm build:n8n
           sed -i 's|/usr/local/bin/n8n|/usr/bin/n8n|g' docker/images/n8n/Dockerfile
 
-      - name: 构建并推送n8n镜像
-        if: steps.check-n8n-exists.outputs.skip_build != 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/images/n8n/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ steps.lowercase.outputs.owner }}/n8n:${{ steps.package.outputs.image_tag }}
-            ghcr.io/${{ steps.lowercase.outputs.owner }}/n8n:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Set up QEMU
+        if: steps.existing.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
 
-      - name: 构建并推送runners镜像
-        if: steps.check-runners-exists.outputs.skip_build != 'true'
-        uses: docker/build-push-action@v5
+      - name: Set up Docker Buildx
+        if: steps.existing.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.existing.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
         with:
-          context: .
-          file: docker/images/runners/Dockerfile
+          context: n8n-source
+          file: n8n-source/docker/images/n8n/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ steps.lowercase.outputs.owner }}/runners:${{ steps.package.outputs.image_tag }}
-            ghcr.io/${{ steps.lowercase.outputs.owner }}/runners:latest
+            ${{ steps.image.outputs.name }}:${{ steps.release.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      
-      - name: 结束
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify published manifest
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          echo "成功构建并推送n8n和runners镜像。"
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          docker buildx imagetools inspect "$IMAGE:latest"
+
+      - name: Write job summary
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          {
+            echo "## n8n image"
+            echo
+            echo "- Version: \`$VERSION\`"
+            echo "- Image: \`$IMAGE:$VERSION\`"
+            echo "- Latest: \`$IMAGE:latest\`"
+            echo "- Scheduled build skipped: \`${{ steps.existing.outputs.skip }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
